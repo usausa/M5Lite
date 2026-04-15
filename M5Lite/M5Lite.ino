@@ -3,7 +3,7 @@
 #include <FastLED.h>
 
 // =====================================================================
-// Setting
+// 設定(変更箇所)
 // =====================================================================
 static constexpr const char* WIFI_SSID       = "xxxxxx";
 static constexpr const char* WIFI_PASSWORD   = "xxxxxxxx";
@@ -12,35 +12,45 @@ static constexpr uint8_t     GATEWAY_IP[]    = {192, 168, 100,   1};
 static constexpr uint8_t     SUBNET_IP[]     = {255, 255, 255, 0};
 static constexpr int         TCP_PORT        = 10000;
 
-// SK6812 LED Unit (GPIO26)
-// LED: 0=Red, 1=Yellow, 2=Green
+// =====================================================================
+// 定義
+// =====================================================================
+
+// SK6812 LEDユニット設定(Groveポート: GPIO26)
+// LEDインデックス: 0=赤, 1=黄, 2=緑
 static constexpr int     LED_PIN        = 26;
 static constexpr int     LED_COUNT      = 3;
 static constexpr uint8_t LED_BRIGHTNESS = 50;
-static constexpr int     BLINK_INTERVAL = 500;  // ms
+static constexpr int     BLINK_INTERVAL = 500;  // 点滅間隔 (ms)
 
-// =====================================================================
-
+// パトライトの点灯状態
 struct PatliteStatus {
-    bool greenBlink  = false;
-    bool yellowBlink = false;
-    bool redBlink    = false;
-    int  buzzer      = 0;
-    bool green       = false;
-    bool yellow      = false;
-    bool red         = false;
+    bool greenBlink  = false;  // 緑点滅
+    bool yellowBlink = false;  // 黄点滅
+    bool redBlink    = false;  // 赤点滅
+    int  buzzer      = 0;      // ブザー(2ビット値: 0-3)
+    bool green       = false;  // 緑点灯
+    bool yellow      = false;  // 黄点灯
+    bool red         = false;  // 赤点灯
 };
 
 // =====================================================================
-
-CRGB leds[LED_COUNT];
-PatliteStatus currentStatus;
-WiFiServer server(TCP_PORT);
-bool blinkOn = false;
-unsigned long lastBlink = 0;
-
+// 状態
 // =====================================================================
 
+WiFiServer    server(TCP_PORT);  // TCPサーバ
+CRGB          leds[LED_COUNT];   // FastLED描画バッファ
+PatliteStatus currentStatus;     // 現在のパトライト状態
+bool          blinkOn   = false; // 点滅トグル(true=点灯フェーズ)
+unsigned long lastBlink = 0;     // 前回トグル時刻(ms)
+
+// =====================================================================
+// ヘルパー
+// =====================================================================
+
+// PatliteStatusを1バイトへシリアライズする
+// ビット割り当て: [7]=緑点滅 [6]=黄点滅 [5]=赤点滅 [4-3]=ブザー [2]=緑 [1]=黄 [0]=赤
+// ブザー自体は外部ユニットが必要なので未サポート、状態の管理のみ
 static uint8_t statusToByte(const PatliteStatus& s) {
     uint8_t b = 0;
     if (s.greenBlink)    b |= 0b10000000;
@@ -54,6 +64,7 @@ static uint8_t statusToByte(const PatliteStatus& s) {
     return b;
 }
 
+// 1バイトをPatliteStatusへデシリアライズする
 static void statusFromByte(PatliteStatus& s, uint8_t b) {
     s.greenBlink  = (b & 0b10000000) != 0;
     s.yellowBlink = (b & 0b01000000) != 0;
@@ -66,12 +77,14 @@ static void statusFromByte(PatliteStatus& s, uint8_t b) {
     s.red    = (b & 0b00000001) != 0;
 }
 
+// steadyがtrue、または点滅フェーズならcolorを、それ以外は黒を返す
 static CRGB lampColor(bool steady, bool blink, CRGB color) {
     if (steady)           return color;
     if (blink && blinkOn) return color;
     return CRGB::Black;
 }
 
+// currentStatusの内容をLEDバッファに反映して表示する
 static void updateLEDs() {
     leds[0] = lampColor(currentStatus.red,    currentStatus.redBlink,    CRGB::Red);
     leds[1] = lampColor(currentStatus.yellow, currentStatus.yellowBlink, CRGB::Yellow);
@@ -79,6 +92,13 @@ static void updateLEDs() {
     FastLED.show();
 }
 
+// パトライト状態をリセットしてLEDを消灯する
+static void resetStatus() {
+    currentStatus = PatliteStatus{};
+    updateLEDs();
+}
+
+// BLINK_INTERVAL(ms)ごとに点滅トグルを切り替え、LEDを再描画する
 static void updateBlink() {
     unsigned long now = millis();
     if (now - lastBlink >= BLINK_INTERVAL) {
@@ -88,10 +108,23 @@ static void updateBlink() {
     }
 }
 
+// =====================================================================
+// 接続中処理
+// =====================================================================
+
+// プロトコル:
+//   'W' + <1byte>  ステータス書き込み → "ACK" または "NACK" (タイムアウト時)
+//   'R'            ステータス読み出し → 'R' + <1byte>
+//   その他         → "NACK"
 static void handleClient(WiFiClient& client) {
     while (client.connected()) {
         updateBlink();
         M5.update();
+
+        // ボタン押下でパトライト状態をリセット
+        if (M5.BtnA.wasPressed()) {
+            resetStatus();
+        }
 
         if (!client.available()) {
             delay(1);
@@ -101,7 +134,7 @@ static void handleClient(WiFiClient& client) {
         uint8_t cmd = client.read();
 
         if (cmd == 'W') {
-            // Wait status (timeout 1s)
+            // データ受信
             unsigned long deadline = millis() + 1000;
             while (!client.available() && millis() < deadline) { delay(1); }
 
@@ -110,78 +143,64 @@ static void handleClient(WiFiClient& client) {
                 statusFromByte(currentStatus, statusByte);
                 updateLEDs();
                 client.write("ACK", 3);
-                M5.Log.printf("W status=0x%02X -> ACK\n", statusByte);
             } else {
                 client.write("NACK", 4);
-                M5.Log.println("W timeout -> NACK");
             }
         } else if (cmd == 'R') {
+            // 現在のステータスを返す
             uint8_t resp[2] = { 'R', statusToByte(currentStatus) };
             client.write(resp, 2);
-            M5.Log.printf("R status=0x%02X\n", resp[1]);
         } else {
             client.write("NACK", 4);
-            M5.Log.printf("Unknown cmd=0x%02X -> NACK\n", cmd);
         }
     }
 }
+
+// =====================================================================
+// ハンドラー
+// =====================================================================
 
 void setup() {
     auto cfg = M5.config();
     M5.begin(cfg);
 
+    // LED ユニット初期化・消灯
     FastLED.addLeds<SK6812, LED_PIN, GRB>(leds, LED_COUNT);
     FastLED.setBrightness(LED_BRIGHTNESS);
     FastLED.clear(true);
 
-    // WiFi connect
+    // WiFi 接続
     WiFi.config(
         IPAddress(STATIC_IP[0],  STATIC_IP[1],  STATIC_IP[2],  STATIC_IP[3]),
         IPAddress(GATEWAY_IP[0], GATEWAY_IP[1], GATEWAY_IP[2], GATEWAY_IP[3]),
         IPAddress(SUBNET_IP[0],  SUBNET_IP[1],  SUBNET_IP[2],  SUBNET_IP[3])
     );
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    M5.Log.print("Connecting to WiFi");
 
+    // 接続完了または20秒タイムアウトまで待機
     int waitCount = 0;
     while (WiFi.status() != WL_CONNECTED) {
         delay(500);
-        leds[1] = (waitCount++ % 2 == 0) ? CRGB::Yellow : CRGB::Black;
-        FastLED.show();
-        M5.Log.print(".");
-        if (waitCount > 40) {
-            M5.Log.println(" TIMEOUT!");
-            leds[0] = CRGB::Red;
-            leds[1] = CRGB::Black;
-            leds[2] = CRGB::Black;
-            FastLED.show();
-            return;
-        }
+        if (++waitCount > 40) return;
     }
 
-    FastLED.clear(true);
-    M5.Log.printf("\nConnected! IP: %s\n", WiFi.localIP().toString().c_str());
-
+    // TCP サーバ起動
     server.begin();
-    M5.Log.printf("TCP server listening on port %d\n", TCP_PORT);
-
-    // Connect complete
-    leds[2] = CRGB::Green;
-    FastLED.show();
-    delay(1000);
-    FastLED.clear(true);
 }
 
 void loop() {
     M5.update();
     updateBlink();
 
+    if (M5.BtnA.wasPressed()) {
+        resetStatus();
+    }
+
+    // 新規クライアント接続を処理する
     WiFiClient client = server.available();
     if (client) {
-        M5.Log.printf("Client connected: %s\n", client.remoteIP().toString().c_str());
         handleClient(client);
         client.stop();
-        M5.Log.println("Client disconnected");
         updateLEDs();
     }
 }
