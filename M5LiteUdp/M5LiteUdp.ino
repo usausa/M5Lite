@@ -1,5 +1,6 @@
 #include <M5Unified.h>
 #include <WiFi.h>
+#include <WiFiUdp.h>
 #include <FastLED.h>
 
 // =====================================================================
@@ -10,7 +11,7 @@ static constexpr const char* WIFI_PASSWORD   = "xxxxxxxx";
 static constexpr uint8_t     STATIC_IP[]     = {192, 168, 100, 100};
 static constexpr uint8_t     GATEWAY_IP[]    = {192, 168, 100,   1};
 static constexpr uint8_t     SUBNET_IP[]     = {255, 255, 255, 0};
-static constexpr int         TCP_PORT        = 10000;
+static constexpr int         UDP_PORT        = 10000;
 
 // =====================================================================
 // 定義
@@ -38,7 +39,7 @@ struct PatliteStatus {
 // 状態
 // =====================================================================
 
-WiFiServer    server(TCP_PORT);  // TCPサーバ
+WiFiUDP       udp;               // UDPソケット
 CRGB          leds[LED_COUNT];   // FastLED描画バッファ
 PatliteStatus currentStatus;     // 現在のパトライト状態
 bool          blinkOn   = false; // 点滅トグル(true=点灯フェーズ)
@@ -109,50 +110,46 @@ static void updateBlink() {
 }
 
 // =====================================================================
-// 接続中処理
+// パケット処理
 // =====================================================================
 
 // プロトコル:
 //   'W' + <1byte>  ステータス書き込み → "ACK"
 //   'R'            ステータス読み出し → 'R' + <1byte>
 //   その他         → "NACK"
-static void handleClient(WiFiClient& client) {
-    while (client.connected()) {
-        updateBlink();
-        M5.update();
+static void handlePacket() {
+    int len = udp.parsePacket();
+    if (len <= 0) return;
 
-        // ボタン押下でパトライト状態をリセット
-        if (M5.BtnA.wasPressed()) {
-            resetStatus();
-        }
+    uint8_t buf[2];
+    int n = udp.read(buf, sizeof(buf));
+    if (n <= 0) return;
 
-        if (!client.available()) {
-            delay(1);
-            continue;
-        }
+    uint8_t cmd = buf[0];
 
-        uint8_t cmd = client.read();
-
-        if (cmd == 'W') {
-            // データ受信
-            unsigned long deadline = millis() + 1000;
-            while (!client.available() && millis() < deadline) { delay(1); }
-
-            if (client.available()) {
-                uint8_t statusByte = client.read();
-                statusFromByte(currentStatus, statusByte);
-                updateLEDs();
-                client.write("ACK", 3);
-            } else {
-                client.write("NACK", 4);
-            }
-        } else if (cmd == 'R') {
-            // 現在のステータスを返す
-            uint8_t resp[2] = { 'R', statusToByte(currentStatus) };
-            client.write(resp, 2);
+    if (cmd == 'W') {
+        // データ受信
+        if (n >= 2) {
+            statusFromByte(currentStatus, buf[1]);
+            updateLEDs();
+            udp.beginPacket(udp.remoteIP(), udp.remotePort());
+            udp.write((const uint8_t*)"ACK", 3);
+            udp.endPacket();
         } else {
-            client.write("NACK", 4);
+            udp.beginPacket(udp.remoteIP(), udp.remotePort());
+            udp.write((const uint8_t*)"NACK", 4);
+            udp.endPacket();
         }
+    } else if (cmd == 'R') {
+        // 現在のステータスを返す
+        uint8_t resp[2] = { 'R', statusToByte(currentStatus) };
+        udp.beginPacket(udp.remoteIP(), udp.remotePort());
+        udp.write(resp, 2);
+        udp.endPacket();
+    } else {
+        udp.beginPacket(udp.remoteIP(), udp.remotePort());
+        udp.write((const uint8_t*)"NACK", 4);
+        udp.endPacket();
     }
 }
 
@@ -184,8 +181,8 @@ void setup() {
         if (++waitCount > 40) return;
     }
 
-    // TCP サーバ起動
-    server.begin();
+    // UDPソケット開始
+    udp.begin(UDP_PORT);
 }
 
 void loop() {
@@ -197,11 +194,6 @@ void loop() {
         resetStatus();
     }
 
-    // 新規クライアント接続を処理する
-    WiFiClient client = server.available();
-    if (client) {
-        handleClient(client);
-        client.stop();
-        updateLEDs();
-    }
+    // 受信パケットを処理する
+    handlePacket();
 }
